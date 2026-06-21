@@ -355,6 +355,7 @@ def get_state() -> dict[str, Any]:
     state.pop("password", None)
     state["active_openvpn_node_id"] = active_openvpn_node_id
     state["is_connecting"] = is_connecting
+    state["maintenance_running"] = maintenance_lock.locked()
     state.setdefault("api_url", API_URL)
     state.setdefault("target_valid_nodes", TARGET_VALID_NODES)
     state.setdefault("fetch_interval_seconds", FETCH_INTERVAL_SECONDS)
@@ -1162,7 +1163,7 @@ def sort_all_nodes(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     )
     untested_nodes = sorted(
-        [n for n in nodes if n.get("probe_status") == "not_checked" and not n.get("active")],
+        [n for n in nodes if n.get("probe_status") in ("not_checked", "testing") and not n.get("active")],
         key=lambda n: (-parse_int(n.get("score")), parse_int(n.get("ping")))
     )
     unavailable_nodes = sorted(
@@ -1405,6 +1406,13 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
     with lock:
         nodes = read_nodes()
         to_test = [n for n in nodes if n.get("id") in node_ids]
+        now = time.time()
+        for n in nodes:
+            if n.get("id") in node_ids and not n.get("active") and n.get("probe_status") != "unavailable":
+                n["probe_status"] = "testing"
+                n["probe_message"] = "正在检测节点连通性..."
+                n["probed_at"] = now
+        write_json(NODES_FILE, sort_all_nodes(nodes))
         
     def test_worker(args: tuple[int, dict[str, Any]]) -> dict[str, Any]:
         idx, n_info = args
@@ -1482,6 +1490,13 @@ def test_multiple_nodes(node_ids: list[str]) -> list[dict[str, Any]]:
                     "probe_message": f"Test exception: {e}",
                     "latency_ms": 0
                 }
+            with lock:
+                current_nodes = read_nodes()
+                for n in current_nodes:
+                    if n.get("id") == nid:
+                        n.update(updated_nodes_map[nid])
+                        break
+                write_json(NODES_FILE, sort_all_nodes(current_nodes))
                 
     # 批量查询并丰富可用节点的地理及 ISP 信息，防止并发时被定位 API 接口限流
     successful_nodes = [res for res in updated_nodes_map.values() if res.get("probe_status") == "available"]
@@ -1746,9 +1761,14 @@ def maintain_valid_nodes(force: bool = False) -> str:
             return "没有拉取到新节点"
 
         with lock:
+            current_nodes = read_nodes()
+            current_by_id = {
+                str(n.get("id")): n
+                for n in current_nodes
+                if n.get("id")
+            }
             active_node = None
             if active_openvpn_node_id:
-                current_nodes = read_nodes()
                 active_node = next((n for n in current_nodes if n.get("id") == active_openvpn_node_id), None)
                 
             merged: list[dict[str, Any]] = []
@@ -1760,6 +1780,22 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 
             for cand in candidates:
                 if cand["id"] not in seen_ids:
+                    previous = current_by_id.get(str(cand["id"]))
+                    if previous:
+                        for key in [
+                            "probe_status",
+                            "probe_message",
+                            "latency_ms",
+                            "probed_at",
+                            "owner",
+                            "asn",
+                            "as_name",
+                            "location",
+                            "ip_type",
+                            "quality",
+                        ]:
+                            if previous.get(key) not in (None, ""):
+                                cand[key] = previous.get(key)
                     merged.append(cand)
                     seen_ids.add(cand["id"])
                     
@@ -2817,6 +2853,12 @@ INDEX_HTML = r"""<!doctype html>
       border-color: rgba(245, 158, 11, 0.2);
     }
 
+    .testing {
+      background: rgba(59, 130, 246, 0.12);
+      color: #93c5fd;
+      border-color: rgba(59, 130, 246, 0.24);
+    }
+
     .current-badge {
       background: rgba(99, 102, 241, 0.15);
       color: #818cf8;
@@ -3171,6 +3213,7 @@ INDEX_HTML = r"""<!doctype html>
     <select id="status_filter">
       <option value="all">全部节点</option>
       <option value="available">可用节点</option>
+      <option value="testing">检测中</option>
       <option value="unavailable">失效节点</option>
     </select>
     <select id="country_filter">
@@ -3621,7 +3664,7 @@ const translateCountry = c => {
 };
 
 const translateStatus = s => {
-  const dict = {"available": "可用", "unavailable": "不可用", "not_checked": "待检测"};
+  const dict = {"available": "可用", "unavailable": "不可用", "testing": "检测中", "not_checked": "待检测"};
   return dict[s] || s || "待检测";
 };
 
@@ -3672,6 +3715,9 @@ function getFilteredNodes() {
     if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) {
       return false;
     }
+    if (selectedStatus === "testing" && n.probe_status !== "testing") {
+      return false;
+    }
     if (selectedStatus === "unavailable" && (n.probe_status !== "unavailable" || n.active)) {
       return false;
     }
@@ -3704,6 +3750,9 @@ function render(){
   // Render separated Active Node Card
   const activeCardContainer = $("active_node_card");
   if (state.is_connecting && !activeNode) {
+    const busyTitle = state.maintenance_running ? "正在更新节点" : "正在连接";
+    const busyLatency = state.maintenance_running ? "节点检测中" : (state.active_node_latency || "正在连接...");
+    const busyMessage = state.last_check_message || (state.maintenance_running ? "正在后台拉取并检测节点，已完成的结果会实时显示在下方列表。" : "正在与 VPN 节点建立加密隧道，请稍候...");
     activeCardContainer.innerHTML = `
       <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
         <div class="active-card-info">
@@ -3712,11 +3761,11 @@ function render(){
           </div>
           <div class="active-card-details">
             <div class="active-card-title" style="color: var(--text-primary);">
-              <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);"><span class="badge-pulse" style="background: #f59e0b;"></span>正在连接</span>
-              <strong>${esc(state.active_node_latency || '正在连接...')}</strong>
+              <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);"><span class="badge-pulse" style="background: #f59e0b;"></span>${esc(busyTitle)}</span>
+              <strong>${esc(busyLatency)}</strong>
             </div>
             <div class="active-card-meta" style="margin-top: 4px;">
-              ${esc(state.last_check_message || '正在与 VPN 节点建立加密隧道，请稍候...')}
+              ${esc(busyMessage)}
             </div>
           </div>
         </div>
@@ -3860,7 +3909,7 @@ function render(){
       const latencyText = n.latency_ms ? `<span class="latency-val ${latencyClass}">${n.latency_ms} ms</span>` : "-";
       const displayLocation = n.location || translateCountry(n.country) || "-";
       
-      const isTesting = testingNodeIds.has(n.id);
+      const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
       const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
       const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
       const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${isTesting ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
@@ -3870,7 +3919,7 @@ function render(){
       const isUnavailable = n.probe_status === "unavailable";
       const connectBtn = isCurrentlyActive 
         ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${(isUnavailable || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
+        : `<button class="connect-btn" ${(isUnavailable || isTesting || state.is_connecting) ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">切换</button>`;
       
       const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
       const isFav = favoriteIds.includes(n.id);
@@ -3966,6 +4015,47 @@ async function toggleFavorite(id, event) {
 }
 
 let pollInterval = null;
+let refreshPollInterval = null;
+
+function refreshButtonBusy(message = "正在后台更新...") {
+  const btn = $("refresh");
+  if (!btn) return;
+  btn.disabled = true;
+  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>${esc(message)}`;
+}
+
+function refreshButtonIdle() {
+  const btn = $("refresh");
+  if (!btn) return;
+  btn.disabled = false;
+  btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>更新节点`;
+}
+
+function startRefreshPolling() {
+  if (refreshPollInterval) clearInterval(refreshPollInterval);
+  refreshButtonBusy("正在检测节点...");
+  refreshPollInterval = setInterval(async () => {
+    try {
+      const resp = await fetch("./api/nodes");
+      const data = await resp.json();
+      nodes = Array.isArray(data.nodes) ? data.nodes : [];
+      state = data.state || {};
+      stableSortNodes();
+      updateCountryFilter();
+      render();
+
+      if (!state.maintenance_running) {
+        clearInterval(refreshPollInterval);
+        refreshPollInterval = null;
+        refreshButtonIdle();
+      }
+    } catch (pe) {
+      clearInterval(refreshPollInterval);
+      refreshPollInterval = null;
+      refreshButtonIdle();
+    }
+  }, 1000);
+}
 
 function startConnectionPolling() {
   if (pollInterval) clearInterval(pollInterval);
@@ -3979,7 +4069,7 @@ function startConnectionPolling() {
       updateCountryFilter();
       render();
       
-      if (!state.is_connecting) {
+      if (!state.is_connecting && !state.maintenance_running) {
         clearInterval(pollInterval);
         pollInterval = null;
         try {
@@ -4064,7 +4154,9 @@ async function load(){
   updateCountryFilter();
   render();
 
-  if (state.is_connecting) {
+  if (state.maintenance_running) {
+    startRefreshPolling();
+  } else if (state.is_connecting) {
     startConnectionPolling();
   }
 }
@@ -4072,15 +4164,16 @@ $("country_filter").onchange=()=>{ currentPage = 1; render(); };
 $("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
 $("status_filter").onchange=()=>{ currentPage = 1; render(); };
 
-$("refresh").onclick=async()=>{ 
-  $("refresh").disabled=true; 
-  $("refresh").textContent="正在后台更新..."; 
-  try{await fetch("./api/refresh_nodes",{method:"POST"}); await load();} 
-  catch(e){}
-  setTimeout(()=>{
-    $("refresh").disabled=false; 
-    $("refresh").textContent="更新节点";
-  }, 3000);
+$("refresh").onclick=async()=>{
+  refreshButtonBusy("正在启动更新...");
+  try{
+    await fetch("./api/refresh_nodes",{method:"POST"});
+    await load();
+    startRefreshPolling();
+  }
+  catch(e){
+    refreshButtonIdle();
+  }
 };
 $("btn_test_proxy").onclick = async () => {
   const btn = $("btn_test_proxy");
